@@ -62,14 +62,16 @@ export interface MediaObject {
 
 export interface Vote {
   id: string;
-  user?: User;
-  post?: Post;
+  '@id'?: string;
+  user?: User | string;
+  post?: Post | string;
   type: 'upvote' | 'downvote';
   createdAt?: string;
 }
 
 export interface AuthResponse {
-  token: string;
+  token?: string;
+  id_token?: string;
   user?: User;
 }
 

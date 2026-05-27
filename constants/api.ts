@@ -3,6 +3,8 @@ const API_BASE_URL_ENV = process.env.EXPO_PUBLIC_API_BASE_URL;
 export const API_BASE_URL =
   API_BASE_URL_ENV?.trim() || 'https://raiddite-api.ac-sandbox.xyz/api';
 
+export const API_ORIGIN = API_BASE_URL.replace(/\/api\/?$/, '');
+
 export const API_ENDPOINTS = {
   // Auth
   AUTH: '/auth',

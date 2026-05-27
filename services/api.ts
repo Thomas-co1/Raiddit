@@ -13,13 +13,53 @@ import {
 
 let authToken: string | null = null;
 
-const defaultHeaders = {
-  'Content-Type': 'application/json',
+type UploadableFile = {
+  uri: string;
+  name?: string | null;
+  type?: string | null;
 };
 
-const getHeaders = () => ({
-  ...defaultHeaders,
-  ...(authToken && { Authorization: `Bearer ${authToken}` }),
+function extractResourceId(value: unknown): string | null {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === 'string') {
+    const cleaned = value.replace(/\.jsonld$/, '').replace(/\/$/, '');
+    const parts = cleaned.split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : null;
+  }
+
+  if (typeof value === 'object' && value !== null) {
+    const maybeId =
+      'id' in value
+        ? (value as { id?: unknown }).id
+        : '@id' in value
+          ? (value as { '@id'?: unknown })['@id']
+          : undefined;
+    return maybeId !== undefined && maybeId !== null ? String(maybeId) : null;
+  }
+
+  return null;
+}
+
+type CreatePostInput = Omit<Partial<Post>, 'image' | 'author'> & {
+  image?: string;
+  author?: string;
+};
+
+type UpdatePostInput = Omit<Partial<Post>, 'image'> & {
+  image?: string | null;
+};
+
+const defaultHeaders = {
+  'Content-Type': 'application/json',
+  Accept: 'application/ld+json, application/json;q=0.9, */*;q=0.8',
+};
+
+const getHeaders = (includeAuth = true, isFormData = false) => ({
+  ...(isFormData ? { Accept: defaultHeaders.Accept } : defaultHeaders),
+  ...(includeAuth && authToken && { Authorization: `Bearer ${authToken}` }),
 });
 
 /**
@@ -27,19 +67,51 @@ const getHeaders = () => ({
  */
 async function apiCall<T>(
   endpoint: string,
-  options?: RequestInit
+  options?: RequestInit,
+  includeAuth = true
 ): Promise<T> {
   const url = `${API_BASE_URL}${endpoint}`;
+  const isFormData =
+    typeof FormData !== 'undefined' && options?.body instanceof FormData;
 
   try {
     const response = await fetch(url, {
       ...options,
-      headers: getHeaders(),
+      headers: {
+        ...getHeaders(includeAuth, isFormData),
+        ...(options?.headers ?? {}),
+      },
     });
 
     if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+
+      try {
+        const payload = (await response.json()) as {
+          description?: string;
+          message?: string;
+          detail?: string;
+          violations?: Array<{ message?: string }>;
+        };
+
+        if (payload.description) {
+          message = payload.description;
+        } else if (payload.message) {
+          message = payload.message;
+        } else if (payload.detail) {
+          message = payload.detail;
+        } else if (payload.violations?.length) {
+          message = payload.violations
+            .map((violation) => violation.message)
+            .filter(Boolean)
+            .join(', ');
+        }
+      } catch {
+        // Keep default HTTP message when backend body is not JSON.
+      }
+
       const error: ApiError = {
-        message: `HTTP ${response.status}`,
+        message,
         status: response.status,
       };
       throw error;
@@ -60,14 +132,31 @@ async function apiCall<T>(
  * Auth Service
  */
 export const authService = {
-  async login(email: string, password: string): Promise<AuthResponse> {
-    const response = await apiCall<AuthResponse>(API_ENDPOINTS.AUTH, {
-      method: 'POST',
-      body: JSON.stringify({ email, password }),
-    });
+  async register(email: string, username: string, password: string): Promise<User> {
+    return apiCall<User>(
+      API_ENDPOINTS.USERS,
+      {
+        method: 'POST',
+        body: JSON.stringify({ email, username, plainPassword: password }),
+      },
+      false
+    );
+  },
 
-    if (response.token) {
-      authToken = response.token;
+  async login(email: string, plainPassword: string): Promise<AuthResponse> {
+    const response = await apiCall<AuthResponse>(
+      API_ENDPOINTS.AUTH,
+      {
+        method: 'POST',
+        body: JSON.stringify({ email, password: plainPassword }),
+      },
+      false
+    );
+
+    const token = response.token ?? response.id_token;
+    if (token) {
+      authToken = token;
+      return { ...response, token };
     }
 
     return response;
@@ -119,7 +208,15 @@ export const usersService = {
   },
 
   async getVotes(userId: string): Promise<Vote[]> {
-    return apiCall<Vote[]>(API_ENDPOINTS.USER_VOTES(userId));
+    const response = await apiCall<ApiCollection<Vote> | Vote[]>(
+      API_ENDPOINTS.USER_VOTES(userId)
+    );
+
+    if (Array.isArray(response)) {
+      return response;
+    }
+
+    return Array.isArray(response.member) ? response.member : [];
   },
 };
 
@@ -128,7 +225,22 @@ export const usersService = {
  */
 export const postsService = {
   async getPage(page = 1): Promise<ApiCollection<Post>> {
-    return apiCall<ApiCollection<Post>>(`${API_ENDPOINTS.POSTS}?page=${page}`);
+    const response = await apiCall<ApiCollection<Post> | Post[]>(
+      `${API_ENDPOINTS.POSTS}?page=${page}`
+    );
+
+    // API may return either a Hydra collection or a plain array depending on config.
+    if (Array.isArray(response)) {
+      return {
+        member: response,
+        totalItems: response.length,
+      };
+    }
+
+    return {
+      ...response,
+      member: Array.isArray(response.member) ? response.member : [],
+    };
   },
 
   async getAll(): Promise<Post[]> {
@@ -140,16 +252,51 @@ export const postsService = {
     return apiCall<Post>(API_ENDPOINTS.POST_DETAIL(id));
   },
 
-  async create(data: Partial<Post>): Promise<Post> {
+  async create(data: CreatePostInput): Promise<Post> {
+    const formData = new FormData();
+
+    formData.append('title', data.title ?? '');
+
+    if (data.description) {
+      formData.append('description', data.description);
+    }
+
+    if (data.content) {
+      formData.append('content', data.content);
+    }
+
+    if (data.latitude) {
+      formData.append('latitude', data.latitude);
+    }
+
+    if (data.longitude) {
+      formData.append('longitude', data.longitude);
+    }
+
+    if (data.customContent) {
+      formData.append('customContent', JSON.stringify(data.customContent));
+    }
+
+    if (data.image) {
+      formData.append('image', data.image);
+    }
+
+    if (data.author) {
+      formData.append('author', data.author);
+    }
+
     return apiCall<Post>(API_ENDPOINTS.POSTS, {
       method: 'POST',
-      body: JSON.stringify(data),
+      body: formData,
     });
   },
 
-  async update(id: string, data: Partial<Post>): Promise<Post> {
+  async update(id: string, data: UpdatePostInput): Promise<Post> {
     return apiCall<Post>(API_ENDPOINTS.POST_DETAIL(id), {
       method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/merge-patch+json',
+      },
       body: JSON.stringify(data),
     });
   },
@@ -170,6 +317,28 @@ export const postsService = {
     return apiCall<Post>(API_ENDPOINTS.POST_DOWNVOTE(id), {
       method: 'POST',
     });
+  },
+
+  async cancelVote(postId: string, userId: string, previousVote: -1 | 1): Promise<void> {
+    const userVotes = await usersService.getVotes(userId);
+    const targetVote = userVotes.find((vote) => {
+      const votePostId = extractResourceId(vote.post);
+      return votePostId === postId;
+    });
+
+    const targetVoteId = extractResourceId(targetVote);
+    if (targetVoteId) {
+      await votesService.delete(targetVoteId);
+      return;
+    }
+
+    // Fallback for APIs where vote endpoints toggle the active vote.
+    if (previousVote === 1) {
+      await postsService.upvote(postId);
+      return;
+    }
+
+    await postsService.downvote(postId);
   },
 };
 
@@ -256,6 +425,72 @@ export const mediaObjectsService = {
       body: JSON.stringify(data),
     });
   },
+
+  async uploadImage(file: UploadableFile): Promise<string> {
+    const formData = new FormData();
+    const fileName = file.name?.trim() || 'upload.jpg';
+    const fileType = file.type?.trim() || 'image/jpeg';
+
+    formData.append(
+      'file',
+      {
+        uri: file.uri,
+        name: fileName,
+        type: fileType,
+      } as unknown as Blob
+    );
+
+    const response = await fetch(`${API_BASE_URL}${API_ENDPOINTS.MEDIA_OBJECTS}`, {
+      method: 'POST',
+      headers: getHeaders(true, true),
+      body: formData,
+    });
+
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+
+      try {
+        const payload = (await response.json()) as {
+          description?: string;
+          message?: string;
+          detail?: string;
+          violations?: Array<{ message?: string }>;
+        };
+
+        if (payload.description) {
+          message = payload.description;
+        } else if (payload.message) {
+          message = payload.message;
+        } else if (payload.detail) {
+          message = payload.detail;
+        } else if (payload.violations?.length) {
+          message = payload.violations
+            .map((violation) => violation.message)
+            .filter(Boolean)
+            .join(', ');
+        }
+      } catch {
+        // Keep default HTTP message when backend body is not JSON.
+      }
+
+      throw {
+        message,
+        status: response.status,
+      } as ApiError;
+    }
+
+    const location =
+      response.headers.get('Location') ?? response.headers.get('Content-Location');
+
+    if (!location) {
+      throw {
+        message: 'Upload image reussi, mais aucune ressource media n\'a ete retournee.',
+        status: response.status,
+      } as ApiError;
+    }
+
+    return location.replace(/\.jsonld$/, '');
+  },
 };
 
 /**
@@ -264,5 +499,13 @@ export const mediaObjectsService = {
 export const votesService = {
   async getById(id: string): Promise<Vote> {
     return apiCall<Vote>(API_ENDPOINTS.VOTE_DETAIL(id));
+  },
+
+  async delete(idOrIri: string): Promise<void> {
+    const voteId = extractResourceId(idOrIri) ?? idOrIri;
+
+    return apiCall<void>(API_ENDPOINTS.VOTE_DETAIL(voteId), {
+      method: 'DELETE',
+    });
   },
 };
